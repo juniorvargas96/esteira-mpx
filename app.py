@@ -10,7 +10,7 @@ PERFIS=["ADMINISTRADOR","GESTOR","FUNCIONÁRIO"]
 PRIORIDADES=["NORMAL","PRIORIDADE","URGENTE"]
 PESO_PRI={"URGENTE":0,"PRIORIDADE":1,"NORMAL":2}
 
-st.set_page_config(page_title="Esteira MPX V5.3",page_icon="🏭",layout="wide")
+st.set_page_config(page_title="Esteira ABX-ON V5.3",page_icon="🏭",layout="wide")
 
 def con():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
@@ -68,12 +68,12 @@ def init():
                 base=login; k=1
                 while c.execute("SELECT 1 FROM usuarios WHERE login=?",(login,)).fetchone():
                     k+=1;login=f"{base}{k}"
-                c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES(?,?,?,'FUNCIONÁRIO',1,?)",(nome,login,sh("mpx123"),now()))
+                c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES(?,?,?,'FUNCIONÁRIO',1,?)",(nome,login,sh("abxon123"),now()))
             c.execute("DROP TABLE usuarios_legado")
         if c.execute("SELECT COUNT(*) n FROM usuarios WHERE perfil='ADMINISTRADOR'").fetchone()["n"]==0:
             login="admin"
             if c.execute("SELECT 1 FROM usuarios WHERE login='admin'").fetchone(): login="adminmpx"
-            c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES('Administrador MPX',?,?, 'ADMINISTRADOR',1,?)",(login,sh("mpx123"),now()))
+            c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES('Administrador ABX-ON',?,?, 'ADMINISTRADOR',1,?)",(login,sh("abxon123"),now()))
 
 def log(c,i,e,a,o=""): c.execute("INSERT INTO historico(anuncio_id,data_hora,etapa,acao,observacao) VALUES(?,?,?,?,?)",(i,now(),e,a,o))
 def perms(uid):
@@ -200,14 +200,14 @@ init()
 
 # login
 if "uid" not in st.session_state:
-    st.title("🏭 ESTEIRA MPX V5.3");st.caption("Acesso interno")
+    st.title("🏭 ESTEIRA ABX-ON V5.3");st.caption("Acesso interno")
     with st.form("login"):
         login=st.text_input("Usuário");senha=st.text_input("Senha",type="password");go=st.form_submit_button("ENTRAR",type="primary",use_container_width=True)
     if go:
         with con() as c:u=c.execute("SELECT * FROM usuarios WHERE login=? AND senha=? AND ativo=1",(login,sh(senha))).fetchone()
         if u:st.session_state.uid=u["id"];st.rerun()
         else:st.error("Usuário ou senha inválidos.")
-    st.info("Primeiro acesso: admin / mpx123 (ou adminmpx / mpx123 se 'admin' já existia no banco migrado).");st.stop()
+    st.info("Primeiro acesso: admin / abxon123 (ou adminmpx / abxon123 se 'admin' já existia no banco migrado).");st.stop()
 
 with con() as c:user=c.execute("SELECT * FROM usuarios WHERE id=?",(st.session_state.uid,)).fetchone()
 if not user or not user["ativo"]:st.session_state.clear();st.rerun()
@@ -248,7 +248,7 @@ if pag=="🏠 Meus Trabalhos":
                 if st.button(rotulo,key=f"a{x['id']}"):st.session_state.aberto=x["id"];st.rerun()
 
 elif pag=="📊 Gestão":
-    st.header("📊 Painel Geral MPX")
+    st.header("📊 Painel Geral ABX-ON")
     with con() as c:
         ativos=c.execute("SELECT * FROM anuncios WHERE status!='OK'").fetchall()
         hoje=datetime.now().strftime("%Y-%m-%d")
