@@ -326,7 +326,7 @@ if "uid" not in st.session_state:
 Utilize o usuário e a senha fornecidos pelo seu **gestor ou responsável**.  
 Caso ainda não tenha acesso, solicite seu cadastro ao administrador do sistema.
 """)
-st.stop()
+    st.stop()
 
 with con() as c:user=c.execute("SELECT * FROM usuarios WHERE id=?",(st.session_state.uid,)).fetchone()
 if not user or not user["ativo"]:st.session_state.clear();st.rerun()
