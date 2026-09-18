@@ -1,7 +1,9 @@
 import streamlit as st
-import base64, sqlite3, hashlib
+import streamlit.components.v1 as components
+import time
+import base64, sqlite3, hashlib, secrets
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 ROOT=Path(__file__).resolve().parent
 DATA=ROOT/"data"; DATA.mkdir(parents=True,exist_ok=True)
@@ -25,6 +27,7 @@ def con():
     c.execute("PRAGMA foreign_keys=ON"); return c
 def now(): return datetime.now().isoformat(timespec="seconds")
 def sh(s): return hashlib.sha256(s.encode()).hexdigest()
+def norm_login(s): return (s or "").strip().casefold()
 def fmt(v):
     try:return datetime.fromisoformat(v).strftime("%d/%m/%Y %H:%M") if v else "—"
     except:return v or "—"
@@ -75,6 +78,9 @@ def init():
         CREATE TABLE IF NOT EXISTS usuario_etapas(
           usuario_id INTEGER NOT NULL,etapa TEXT NOT NULL,UNIQUE(usuario_id,etapa),
           FOREIGN KEY(usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS login_sessions(
+          token TEXT PRIMARY KEY, usuario_id INTEGER NOT NULL, expira_em TEXT NOT NULL,
+          FOREIGN KEY(usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE);
         """)
         if table_exists(c,"usuarios_legado"):
             for r in c.execute("SELECT * FROM usuarios_legado").fetchall():
@@ -94,7 +100,10 @@ def log(c,i,e,a,o=""): c.execute("INSERT INTO historico(anuncio_id,data_hora,eta
 def perms(uid):
     with con() as c:return [r["etapa"] for r in c.execute("SELECT etapa FROM usuario_etapas WHERE usuario_id=?",(uid,))]
 def criar_user(nome,login,senha,perfil,ets):
+    login=norm_login(login)
     with con() as c:
+        if c.execute("SELECT 1 FROM usuarios WHERE lower(login)=lower(?)",(login,)).fetchone():
+            raise sqlite3.IntegrityError("Login já existe")
         cur=c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES(?,?,?,?,1,?)",(nome,login,sh(senha),perfil,now()))
         for e in ets:c.execute("INSERT INTO usuario_etapas VALUES(?,?)",(cur.lastrowid,e))
 def update_user(uid,nome,perfil,ativo,ets,senha=""):
@@ -304,7 +313,40 @@ def trabalho(a,user):
                     for aid in ids: enviar_correcao(aid,user,destino,motivo)
                     st.session_state.pop("aberto",None);st.rerun()
 
+def criar_sessao_persistente(uid):
+    token=secrets.token_urlsafe(32)
+    exp=(datetime.now()+timedelta(days=30)).isoformat(timespec="seconds")
+    with con() as c:
+        c.execute("DELETE FROM login_sessions WHERE usuario_id=? OR expira_em<?",(uid,now()))
+        c.execute("INSERT INTO login_sessions(token,usuario_id,expira_em) VALUES(?,?,?)",(token,uid,exp))
+    return token
+
+def usuario_por_token(token):
+    if not token:return None
+    with con() as c:
+        r=c.execute("""SELECT u.* FROM login_sessions s JOIN usuarios u ON u.id=s.usuario_id
+                     WHERE s.token=? AND s.expira_em>? AND u.ativo=1""",(token,now())).fetchone()
+    return r
+
+def remover_sessao(token):
+    if token:
+        with con() as c:c.execute("DELETE FROM login_sessions WHERE token=?",(token,))
+
 init()
+
+# Cookie persistente: mantém o funcionário conectado por até 30 dias, até clicar em Sair.
+COOKIE_NAME="abxon_login"
+def set_cookie(name,value,days=30):
+    components.html(f"""<script>document.cookie = {name!r} + '=' + {value!r} + '; max-age=' + ({days}*86400) + '; path=/; SameSite=Lax';</script>""",height=0)
+def del_cookie(name):
+    components.html(f"""<script>document.cookie = {name!r} + '=; max-age=0; path=/; SameSite=Lax';</script>""",height=0)
+
+if "uid" not in st.session_state:
+    token_cookie=st.context.cookies.get(COOKIE_NAME)
+    u_cookie=usuario_por_token(token_cookie)
+    if u_cookie:
+        st.session_state.uid=u_cookie["id"]
+        st.session_state.login_token=token_cookie
 
 # login
 if "uid" not in st.session_state:
@@ -318,8 +360,14 @@ if "uid" not in st.session_state:
     with st.form("login"):
         login=st.text_input("Usuário");senha=st.text_input("Senha",type="password");go=st.form_submit_button("ENTRAR",type="primary",use_container_width=True)
     if go:
-        with con() as c:u=c.execute("SELECT * FROM usuarios WHERE login=? AND senha=? AND ativo=1",(login,sh(senha))).fetchone()
-        if u:st.session_state.uid=u["id"];st.rerun()
+        with con() as c:u=c.execute("SELECT * FROM usuarios WHERE lower(login)=lower(?) AND senha=? AND ativo=1",(norm_login(login),sh(senha))).fetchone()
+        if u:
+            token=criar_sessao_persistente(u["id"])
+            set_cookie(COOKIE_NAME,token,30)
+            st.session_state.uid=u["id"]
+            st.session_state.login_token=token
+            time.sleep(0.35)
+            st.rerun()
         else:st.error("Usuário ou senha inválidos.")
     st.info("""
 **Acesso à Esteira ABX-ON**  
@@ -332,7 +380,12 @@ with con() as c:user=c.execute("SELECT * FROM usuarios WHERE id=?",(st.session_s
 if not user or not user["ativo"]:st.session_state.clear();st.rerun()
 ets=perms(user["id"]);adm=user["perfil"]=="ADMINISTRADOR";gest=user["perfil"] in ["ADMINISTRADOR","GESTOR"]
 st.sidebar.write(f"**{user['nome']}**");st.sidebar.caption(user["perfil"])
-if st.sidebar.button("Sair"):st.session_state.clear();st.rerun()
+if st.sidebar.button("Sair"):
+    token=st.session_state.get("login_token") or st.context.cookies.get(COOKIE_NAME)
+    remover_sessao(token)
+    del_cookie(COOKIE_NAME)
+    st.session_state.clear()
+    time.sleep(0.35);st.rerun()
 menu=["🏠 Meus Trabalhos","🔎 Buscar"]+(["📊 Gestão"] if gest else [])+(["⚙️ Administração","➕ Novo Produto"] if adm else [])
 pag=st.sidebar.radio("Menu",menu)
 
