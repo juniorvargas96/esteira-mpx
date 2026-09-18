@@ -1,4 +1,5 @@
-import streamlit as st, sqlite3, hashlib
+import streamlit as st
+import base64, sqlite3, hashlib
 from pathlib import Path
 from datetime import datetime
 
@@ -10,7 +11,14 @@ PERFIS=["ADMINISTRADOR","GESTOR","FUNCIONÁRIO"]
 PRIORIDADES=["NORMAL","PRIORIDADE","URGENTE"]
 PESO_PRI={"URGENTE":0,"PRIORIDADE":1,"NORMAL":2}
 
-st.set_page_config(page_title="Esteira ABX-ON V5.3",page_icon="🏭",layout="wide")
+
+def _img_b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+logo_b64 = _img_b64("logo_abxon.jpg")
+
+st.set_page_config(page_title="Esteira ABX-ON",page_icon="favicon_abxon.png",layout="wide")
 
 def con():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
@@ -38,6 +46,13 @@ def init():
         CREATE TABLE IF NOT EXISTS anuncios(id INTEGER PRIMARY KEY AUTOINCREMENT,sku TEXT,numero INTEGER,titulo TEXT,descricao TEXT,preco REAL,etapa TEXT DEFAULT 'BASE',status TEXT DEFAULT 'AGUARDANDO',link_foto TEXT,link_video TEXT,criado_em TEXT,atualizado_em TEXT,UNIQUE(sku,numero));
         CREATE TABLE IF NOT EXISTS historico(id INTEGER PRIMARY KEY AUTOINCREMENT,anuncio_id INTEGER,data_hora TEXT,etapa TEXT,acao TEXT,observacao TEXT);
         """)
+        # V6: dados compartilhados por SKU nas etapas pós-BASE.
+        for n,t in [("foto_padrao","TEXT"),("video_padrao","TEXT"),("promo_padrao","TEXT"),("ads_padrao","TEXT")]:
+            if not col_exists(c,"produtos",n):
+                c.execute(f"ALTER TABLE produtos ADD COLUMN {n} {t}")
+        for n,t in [("foto_override","TEXT"),("video_override","TEXT"),("promo_override","TEXT"),("ads_override","TEXT")]:
+            if not col_exists(c,"anuncios",n):
+                c.execute(f"ALTER TABLE anuncios ADD COLUMN {n} {t}")
         # migrate anuncios
         for n,t,default in [
             ("responsavel","TEXT",None),("entrada_etapa_em","TEXT",None),("inicio_etapa_em","TEXT",None),
@@ -159,55 +174,159 @@ def fila(etapa):
     with con() as c:rows=c.execute("SELECT * FROM anuncios WHERE etapa=? AND status!='OK'",(etapa,)).fetchall()
     return sorted(rows,key=lambda x:(0 if x["status"]=="CORRIGIR" else 1,PESO_PRI.get(x["prioridade"],2),x["entrada_etapa_em"] or ""))
 
+
+def anuncios_do_sku_na_etapa(sku,etapa):
+    with con() as c:
+        return c.execute("SELECT * FROM anuncios WHERE sku=? AND etapa=? AND status!='OK' ORDER BY numero",(sku,etapa)).fetchall()
+
+def finalizar_grupo(sku,etapa,user,campos,personalizados=None):
+    """Finaliza todos os anúncios do mesmo SKU que estão juntos na etapa.
+    personalizados: dict anuncio_id -> valor específico para FOTO/VÍDEO/PROMO/ADS.
+    """
+    personalizados=personalizados or {}
+    with con() as c:
+        grupo=c.execute("SELECT * FROM anuncios WHERE sku=? AND etapa=? AND status!='OK' ORDER BY numero",(sku,etapa)).fetchall()
+        if not grupo:return "Nenhum anúncio disponível nesta etapa."
+        p=c.execute("SELECT * FROM produtos WHERE sku=?",(sku,)).fetchone()
+        if etapa=="FOTO" and not campos.get("foto","").strip():return "Informe o link da foto."
+        if etapa=="VÍDEO" and not campos.get("video","").strip():return "Informe o link do vídeo."
+        if etapa=="FÍSICA" and any(float(campos.get(k,0) or 0)<=0 for k in ["altura","largura","comprimento","peso"]):
+            return "Preencha altura, largura, comprimento e peso."
+        if etapa=="FOTO": c.execute("UPDATE produtos SET foto_padrao=? WHERE sku=?",(campos["foto"],sku))
+        if etapa=="VÍDEO": c.execute("UPDATE produtos SET video_padrao=? WHERE sku=?",(campos["video"],sku))
+        if etapa=="PROMO": c.execute("UPDATE produtos SET promo_padrao=? WHERE sku=?",(campos.get("promo",""),sku))
+        if etapa=="ADS": c.execute("UPDATE produtos SET ads_padrao=? WHERE sku=?",(campos.get("ads",""),sku))
+        if etapa=="FÍSICA":
+            c.execute("UPDATE produtos SET altura=?,largura=?,comprimento=?,peso=? WHERE sku=?",
+                      (campos["altura"],campos["largura"],campos["comprimento"],campos["peso"],sku))
+    # Reuse the already-tested per-ad transition/correction engine.
+    for a in grupo:
+        with con() as c:
+            if etapa=="FOTO":
+                v=personalizados.get(a["id"],"")
+                c.execute("UPDATE anuncios SET link_foto=?,foto_override=? WHERE id=?",(v or campos["foto"],v or None,a["id"]))
+            elif etapa=="VÍDEO":
+                v=personalizados.get(a["id"],"")
+                c.execute("UPDATE anuncios SET link_video=?,video_override=? WHERE id=?",(v or campos["video"],v or None,a["id"]))
+            elif etapa=="PROMO":
+                v=personalizados.get(a["id"],"")
+                c.execute("UPDATE anuncios SET promo_override=? WHERE id=?",(v or None,a["id"]))
+            elif etapa=="ADS":
+                v=personalizados.get(a["id"],"")
+                c.execute("UPDATE anuncios SET ads_override=? WHERE id=?",(v or None,a["id"]))
+        er=finalizar(a["id"],user,campos)
+        if er:return er
+    return None
+
 def trabalho(a,user):
     abrir(a["id"],user)
     with con() as c:
         a=c.execute("SELECT * FROM anuncios WHERE id=?",(a["id"],)).fetchone()
         p=c.execute("SELECT * FROM produtos WHERE sku=?",(a["sku"],)).fetchone()
-    st.header(f"{'🔴 ' if a['prioridade']=='URGENTE' else '🟡 ' if a['prioridade']=='PRIORIDADE' else ''}{a['sku']} · Anúncio {a['numero']}")
-    st.caption(f"{a['etapa']} · {a['responsavel'] or user['nome']} · em trabalho {age(a['inicio_etapa_em'])}")
+    etapa=a["etapa"]
+    grupo=anuncios_do_sku_na_etapa(a["sku"],etapa)
+    # BASE remains independent per listing; correction also remains independent.
+    agrupar=(etapa!="BASE" and a["status"]!="CORRIGIR" and len(grupo)>1)
+
+    st.header(f"{'🔴 ' if a['prioridade']=='URGENTE' else '🟡 ' if a['prioridade']=='PRIORIDADE' else ''}{a['sku']} · {'SKU' if agrupar else 'Anúncio '+str(a['numero'])}")
+    if agrupar:
+        st.info(f"🧩 **{len(grupo)} anúncios vinculados neste SKU**. O dado informado abaixo será aplicado a todos por padrão.")
+    else:
+        st.caption(f"{etapa} · {a['responsavel'] or user['nome']} · em trabalho {age(a['inicio_etapa_em'])}")
+
     em_correcao=bool(a["correcao_retorno"] or a["correcao_origem"] or a["correcao_destino"])
     if em_correcao:
         st.error("🔴 CORREÇÃO SOLICITADA")
         st.write(f"**Solicitada por:** {a['correcao_origem'] or '—'}")
         st.write(f"**Motivo:** {a['correcao_motivo'] or 'Sem observação informada'}")
-        st.info(f"Depois de finalizar, este trabalho voltará automaticamente para **{a['correcao_retorno'] or a['correcao_origem'] or 'a etapa solicitante'}**.")
-    campos={}
-    if a["etapa"]=="BASE":
-        campos["titulo"]=st.text_input("Título",a["titulo"] or "");campos["descricao"]=st.text_area("Descrição",a["descricao"] or "",height=180);campos["preco"]=st.number_input("Preço",0.0,value=float(a["preco"] or 0))
-    elif a["etapa"]=="FOTO":st.info(a["titulo"] or "Sem título");campos["foto"]=st.text_input("Link da foto",a["link_foto"] or "")
-    elif a["etapa"]=="FÍSICA":
-        campos["altura"]=st.number_input("Altura",0.0,value=float(p["altura"] or 0));campos["largura"]=st.number_input("Largura",0.0,value=float(p["largura"] or 0))
-        campos["comprimento"]=st.number_input("Comprimento",0.0,value=float(p["comprimento"] or 0));campos["peso"]=st.number_input("Peso",0.0,value=float(p["peso"] or 0))
-    elif a["etapa"]=="VÍDEO":campos["video"]=st.text_input("Link do vídeo",a["link_video"] or "")
-    elif a["etapa"]=="PROMO":st.info("Confira e finalize quando a promoção estiver preparada.")
-    else:st.info("Confira e finalize quando o ADS estiver configurado.")
-    texto_finalizar="✅ FINALIZAR CORREÇÃO" if em_correcao else f"✅ FINALIZAR {a['etapa']}"
-    if st.button(texto_finalizar,type="primary",use_container_width=True):
-        er=finalizar(a["id"],user,campos)
-        if er:st.error(er)
-        else:st.session_state.pop("aberto",None);st.rerun()
-    destinos=[e for e in ETAPAS if ETAPAS.index(e)<ETAPAS.index(a["etapa"])]
+        st.info(f"Depois de finalizar, voltará automaticamente para **{a['correcao_retorno'] or a['correcao_origem']}**.")
+
+    campos={}; personalizados={}
+    if etapa=="BASE":
+        campos["titulo"]=st.text_input("Título",a["titulo"] or "")
+        campos["descricao"]=st.text_area("Descrição",a["descricao"] or "",height=180)
+        campos["preco"]=st.number_input("Preço",0.0,value=float(a["preco"] or 0))
+    elif etapa=="FOTO":
+        campos["foto"]=st.text_input("Link da foto — padrão do SKU",p["foto_padrao"] or a["link_foto"] or "")
+    elif etapa=="FÍSICA":
+        campos["altura"]=st.number_input("Altura",0.0,value=float(p["altura"] or 0))
+        campos["largura"]=st.number_input("Largura",0.0,value=float(p["largura"] or 0))
+        campos["comprimento"]=st.number_input("Comprimento",0.0,value=float(p["comprimento"] or 0))
+        campos["peso"]=st.number_input("Peso",0.0,value=float(p["peso"] or 0))
+    elif etapa=="VÍDEO":
+        campos["video"]=st.text_input("Link do vídeo — padrão do SKU",p["video_padrao"] or a["link_video"] or "")
+    elif etapa=="PROMO":
+        st.info("Confira a promoção dos anúncios vinculados e finalize quando estiver concluída.")
+    else:
+        st.info("Confira o ADS dos anúncios vinculados e finalize quando estiver concluído.")
+
+    if agrupar and etapa in ["FOTO","VÍDEO"]:
+        with st.expander("✏️ Personalizar algum anúncio"):
+            st.caption("Deixe vazio para usar o dado padrão do SKU.")
+            for x in grupo:
+                atual=""
+                if etapa=="FOTO": atual=x["foto_override"] or ""
+                elif etapa=="VÍDEO": atual=x["video_override"] or ""
+                elif etapa=="PROMO": atual=x["promo_override"] or ""
+                elif etapa=="ADS": atual=x["ads_override"] or ""
+                personalizados[x["id"]]=st.text_input(f"Anúncio {x['numero']} — {x['titulo'] or 'Sem título'}",atual,key=f"ov_{etapa}_{x['id']}")
+
+    if agrupar:
+        texto=f"✅ FINALIZAR {etapa} PARA OS {len(grupo)} ANÚNCIOS"
+        if st.button(texto,type="primary",use_container_width=True):
+            er=finalizar_grupo(a["sku"],etapa,user,campos,personalizados)
+            if er:st.error(er)
+            else:st.session_state.pop("aberto",None);st.rerun()
+    else:
+        texto_finalizar="✅ FINALIZAR CORREÇÃO" if em_correcao else f"✅ FINALIZAR {etapa}"
+        if st.button(texto_finalizar,type="primary",use_container_width=True):
+            er=finalizar(a["id"],user,campos)
+            if er:st.error(er)
+            else:st.session_state.pop("aberto",None);st.rerun()
+
+    destinos=[e for e in ETAPAS if ETAPAS.index(e)<ETAPAS.index(etapa)]
     if destinos and not em_correcao:
         with st.expander("↩ Enviar para correção"):
-            destino=st.selectbox("Qual etapa precisa corrigir?",destinos)
-            motivo=st.text_area("Motivo da correção")
+            if agrupar:
+                opcoes={f"Anúncio {x['numero']} — {x['titulo'] or 'Sem título'}":x["id"] for x in grupo}
+                escolhidos=st.multiselect("Qual(is) anúncio(s) precisa(m) de correção?",list(opcoes.keys()))
+                st.caption(f"SKU {a['sku']} possui {len(grupo)} anúncios nesta etapa. Selecione um, vários ou todos.")
+            else:
+                opcoes={f"Anúncio {a['numero']} — {a['titulo'] or 'Sem título'}":a["id"]}
+                escolhidos=list(opcoes.keys())
+            destino=st.selectbox("Enviar para qual etapa?",destinos)
+            motivo=st.text_area("Motivo / observação da correção")
             if st.button("ENVIAR CORREÇÃO"):
-                if motivo.strip():enviar_correcao(a["id"],user,destino,motivo);st.session_state.pop("aberto",None);st.rerun()
-                else:st.error("Informe o motivo.")
+                ids=[opcoes[x] for x in escolhidos]
+                if not ids: st.error("Selecione pelo menos um anúncio.")
+                elif not motivo.strip(): st.error("Informe o motivo da correção.")
+                else:
+                    for aid in ids: enviar_correcao(aid,user,destino,motivo)
+                    st.session_state.pop("aberto",None);st.rerun()
 
 init()
 
 # login
 if "uid" not in st.session_state:
-    st.title("🏭 ESTEIRA ABX-ON V5.3");st.caption("Acesso interno")
+    st.markdown("""
+    <div style="display:flex;align-items:center;gap:16px;margin:4px 0 8px 0;">
+        <img src="data:image/png;base64,{logo_b64}" style="height:58px;width:auto;object-fit:contain;">
+        <div style="font-size:2.45rem;font-weight:800;line-height:1;margin:0;">ESTEIRA ABX-ON</div>
+    </div>
+    """.format(logo_b64=logo_b64), unsafe_allow_html=True)
+    st.caption("Acesso interno")
     with st.form("login"):
         login=st.text_input("Usuário");senha=st.text_input("Senha",type="password");go=st.form_submit_button("ENTRAR",type="primary",use_container_width=True)
     if go:
         with con() as c:u=c.execute("SELECT * FROM usuarios WHERE login=? AND senha=? AND ativo=1",(login,sh(senha))).fetchone()
         if u:st.session_state.uid=u["id"];st.rerun()
         else:st.error("Usuário ou senha inválidos.")
-    st.info("Primeiro acesso: admin / abxon123 (ou adminmpx / abxon123 se 'admin' já existia no banco migrado).");st.stop()
+    st.info("""
+**Acesso à Esteira ABX-ON**  
+Utilize o usuário e a senha fornecidos pelo seu **gestor ou responsável**.  
+Caso ainda não tenha acesso, solicite seu cadastro ao administrador do sistema.
+""")
+st.stop()
 
 with con() as c:user=c.execute("SELECT * FROM usuarios WHERE id=?",(st.session_state.uid,)).fetchone()
 if not user or not user["ativo"]:st.session_state.clear();st.rerun()
@@ -228,6 +347,14 @@ if pag=="🏠 Meus Trabalhos":
         st.header(f"Olá, {user['nome']} 👋")
         etapa=st.selectbox("Etapa",minhas) if len(minhas)>1 else minhas[0]
         rows=fila(etapa)
+        # V6: pós-BASE, um SKU normal aparece como um trabalho; correções continuam individuais.
+        if etapa!="BASE":
+            vistos=set(); compact=[]
+            for x in rows:
+                chave=("CORR",x["id"]) if x["status"]=="CORRIGIR" else ("SKU",x["sku"])
+                if chave not in vistos:
+                    vistos.add(chave);compact.append(x)
+            rows=compact
         hoje=datetime.now().strftime("%Y-%m-%d")
         with con() as c:feitos=c.execute("SELECT COUNT(*) n FROM historico WHERE acao='ETAPA CONCLUÍDA' AND observacao=? AND substr(data_hora,1,10)=?",(user["nome"],hoje)).fetchone()["n"]
         c1,c2,c3=st.columns(3);c1.metric("Para fazer",len(rows));c2.metric("Correções",sum(x["status"]=="CORRIGIR" for x in rows));c3.metric("Concluídos hoje",feitos)
@@ -236,7 +363,12 @@ if pag=="🏠 Meus Trabalhos":
         for x in rows:
             ico="🔴" if x["prioridade"]=="URGENTE" else "🟡" if x["prioridade"]=="PRIORIDADE" else "⚪"
             with st.container(border=True):
-                st.write(f"**{ico} {x['sku']} · Anúncio {x['numero']}**");st.caption(x["titulo"] or "Sem título")
+                if etapa!="BASE" and x["status"]!="CORRIGIR":
+                    with con() as c:nv=c.execute("SELECT COUNT(*) n FROM anuncios WHERE sku=? AND etapa=? AND status!='OK'",(x["sku"],etapa)).fetchone()["n"]
+                    st.write(f"**{ico} {x['sku']} · 🧩 {nv} anúncio(s) vinculados**")
+                else:
+                    st.write(f"**{ico} {x['sku']} · Anúncio {x['numero']}**")
+                st.caption(x["titulo"] or "Sem título")
                 if x["status"]=="CORRIGIR":
                     st.error(f"🔴 CORREÇÃO SOLICITADA POR {x['correcao_origem'] or 'ETAPA ANTERIOR'}")
                     st.write(f"**Motivo:** {x['correcao_motivo'] or 'Sem observação informada'}")
