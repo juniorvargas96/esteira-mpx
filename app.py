@@ -3,6 +3,7 @@ import streamlit.components.v1 as components
 import time, base64, hashlib, secrets
 import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -21,10 +22,24 @@ def _img_b64(path):
 logo_b64=_img_b64(ROOT/"logo_abxon.jpg")
 st.set_page_config(page_title="Esteira ABX-ON",page_icon=str(ROOT/"favicon_abxon.png"),layout="wide")
 
-def con():
+@st.cache_resource(show_spinner=False)
+def get_pool():
     url=st.secrets.get("DATABASE_URL","")
-    if not url: raise RuntimeError("DATABASE_URL não configurada nos Secrets do Streamlit.")
-    return psycopg.connect(url,row_factory=dict_row)
+    if not url:
+        raise RuntimeError("DATABASE_URL não configurada nos Secrets do Streamlit.")
+    # Reaproveita conexões entre os reruns do Streamlit, evitando novo handshake
+    # com o Supabase a cada clique.
+    return ConnectionPool(
+        conninfo=url,
+        min_size=1,
+        max_size=6,
+        timeout=8,
+        kwargs={"row_factory": dict_row},
+        open=True,
+    )
+
+def con():
+    return get_pool().connection()
 
 def now(): return datetime.now().isoformat(timespec="seconds")
 def sh(s): return hashlib.sha256(s.encode()).hexdigest()
@@ -46,8 +61,9 @@ def age(v):
     if m<1440:return f"{m//60}h {m%60:02d}min"
     return f"{m//1440}d {(m%1440)//60}h"
 
+@st.cache_resource(show_spinner=False)
 def init():
-    """Migração automática V7 sobre o banco PostgreSQL/Supabase existente."""
+    """Migração automática V7.1.1 executada uma única vez por processo."""
     with con() as c:
         # tabelas-base
         c.execute("""CREATE TABLE IF NOT EXISTS produtos(
@@ -113,8 +129,12 @@ def init():
 def log(c,i,e,a,o=""):
     c.execute("INSERT INTO historico(anuncio_id,data_hora,etapa,acao,observacao) VALUES(%s,%s,%s,%s,%s)",(i,now(),e,a,o))
 
+@st.cache_data(ttl=20, show_spinner=False)
 def perms(uid):
-    with con() as c:return [r["etapa"] for r in c.execute("SELECT etapa FROM usuario_etapas WHERE usuario_id=%s",(uid,))]
+    with con() as c:
+        return [r["etapa"] for r in c.execute(
+            "SELECT etapa FROM usuario_etapas WHERE usuario_id=%s",(uid,)
+        )]
 
 def criar_user(nome,login,senha,perfil,ets):
     login=norm_login(login)
@@ -125,6 +145,7 @@ def criar_user(nome,login,senha,perfil,ets):
                          VALUES(%s,%s,%s,%s,1,%s) RETURNING id""",
                       (nome,login,sh(senha),perfil,now())).fetchone()["id"]
         for e in ets:c.execute("INSERT INTO usuario_etapas(usuario_id,etapa) VALUES(%s,%s) ON CONFLICT DO NOTHING",(uid,e))
+    perms.clear()
 
 def update_user(uid,nome,perfil,ativo,ets,senha=""):
     with con() as c:
@@ -132,6 +153,7 @@ def update_user(uid,nome,perfil,ativo,ets,senha=""):
         if senha:c.execute("UPDATE usuarios SET senha=%s WHERE id=%s",(sh(senha),uid))
         c.execute("DELETE FROM usuario_etapas WHERE usuario_id=%s",(uid,))
         for e in ets:c.execute("INSERT INTO usuario_etapas(usuario_id,etapa) VALUES(%s,%s) ON CONFLICT DO NOTHING",(uid,e))
+    perms.clear()
 
 def titulos_anuncio(c,aid):
     return [r["titulo"] for r in c.execute("SELECT titulo FROM anuncio_titulos WHERE anuncio_id=%s ORDER BY ordem",(aid,)).fetchall()]
@@ -236,11 +258,17 @@ def fila(etapa):
     return sorted(rows,key=lambda x:(0 if x["status"]=="CORRIGIR" else 1,PESO_PRI.get(x["prioridade"],2),x["entrada_etapa_em"] or ""))
 
 def trabalho(a,user):
-    abrir(a["id"],user)
+    aid=a["id"]
     with con() as c:
-        a=c.execute("SELECT * FROM anuncios WHERE id=%s",(a["id"],)).fetchone()
+        a=c.execute("SELECT * FROM anuncios WHERE id=%s",(aid,)).fetchone()
+        if not a["inicio_etapa_em"]:
+            t=now(); corr=bool(a["correcao_retorno"] or a["correcao_origem"] or a["correcao_destino"])
+            c.execute("""UPDATE anuncios SET inicio_etapa_em=%s,responsavel=%s,status=%s,atualizado_em=%s WHERE id=%s""",
+                      (t,user["nome"],"CORRIGIR" if corr else "EM ANDAMENTO",t,aid))
+            log(c,aid,a["etapa"],"CORREÇÃO ABERTA" if corr else "TRABALHO ABERTO",user["nome"])
+            a=c.execute("SELECT * FROM anuncios WHERE id=%s",(aid,)).fetchone()
         p=c.execute("SELECT * FROM produtos WHERE sku=%s",(a["sku"],)).fetchone()
-        tits=titulos_anuncio(c,a["id"])
+        tits=titulos_anuncio(c,aid)
     etapa=a["etapa"]
     ico="🔴 " if a["prioridade"]=="URGENTE" else "🟡 " if a["prioridade"]=="PRIORIDADE" else ""
     st.header(f"{ico}{a['sku']} · {a['canal'] or '—'}")
@@ -351,9 +379,8 @@ if pag=="🏠 Meus Trabalhos":
     minhas=ETAPAS if adm else [e for e in ets if e in ETAPAS]
     if not minhas:st.warning("O administrador ainda não atribuiu uma etapa ao seu acesso.");st.stop()
     if "aberto" in st.session_state:
-        with con() as c:a=c.execute("SELECT * FROM anuncios WHERE id=%s",(st.session_state.aberto,)).fetchone()
         if st.button("← Voltar"):st.session_state.pop("aberto");st.rerun()
-        trabalho(a,user)
+        trabalho({"id":st.session_state.aberto},user)
     else:
         st.header(f"Olá, {user['nome']} 👋")
         etapa=st.selectbox("Etapa",minhas) if len(minhas)>1 else minhas[0]
