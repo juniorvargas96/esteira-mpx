@@ -1,13 +1,13 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import time
-import base64, sqlite3, hashlib, secrets
+import base64, hashlib, secrets
+import psycopg
+from psycopg.rows import dict_row
 from pathlib import Path
 from datetime import datetime, timedelta
 
 ROOT=Path(__file__).resolve().parent
-DATA=ROOT/"data"; DATA.mkdir(parents=True,exist_ok=True)
-DB=DATA/"esteira.db"
 ETAPAS=["BASE","FOTO","FÍSICA","VÍDEO","PROMO","ADS"]
 PERFIS=["ADMINISTRADOR","GESTOR","FUNCIONÁRIO"]
 PRIORIDADES=["NORMAL","PRIORIDADE","URGENTE"]
@@ -23,8 +23,10 @@ logo_b64 = _img_b64("logo_abxon.jpg")
 st.set_page_config(page_title="Esteira ABX-ON",page_icon="favicon_abxon.png",layout="wide")
 
 def con():
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON"); return c
+    url=st.secrets.get("DATABASE_URL","")
+    if not url:
+        raise RuntimeError("DATABASE_URL não configurada nos Secrets do Streamlit.")
+    return psycopg.connect(url, row_factory=dict_row)
 def now(): return datetime.now().isoformat(timespec="seconds")
 def sh(s): return hashlib.sha256(s.encode()).hexdigest()
 def norm_login(s): return (s or "").strip().casefold()
@@ -38,98 +40,63 @@ def age(v):
     if m<60:return f"{m} min"
     if m<1440:return f"{m//60}h {m%60:02d}min"
     return f"{m//1440}d {(m%1440)//60}h"
-def col_exists(c,t,col): return col in [r["name"] for r in c.execute(f"PRAGMA table_info({t})")]
-def table_exists(c,t): return c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(t,)).fetchone() is not None
-
 def init():
+    """Valida o schema PostgreSQL e garante um administrador inicial."""
+    tabelas=["produtos","anuncios","historico","usuarios","usuario_etapas","login_sessions"]
     with con() as c:
-        # base tables
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS produtos(sku TEXT PRIMARY KEY,altura REAL,largura REAL,comprimento REAL,peso REAL,criado_em TEXT);
-        CREATE TABLE IF NOT EXISTS anuncios(id INTEGER PRIMARY KEY AUTOINCREMENT,sku TEXT,numero INTEGER,titulo TEXT,descricao TEXT,preco REAL,etapa TEXT DEFAULT 'BASE',status TEXT DEFAULT 'AGUARDANDO',link_foto TEXT,link_video TEXT,criado_em TEXT,atualizado_em TEXT,UNIQUE(sku,numero));
-        CREATE TABLE IF NOT EXISTS historico(id INTEGER PRIMARY KEY AUTOINCREMENT,anuncio_id INTEGER,data_hora TEXT,etapa TEXT,acao TEXT,observacao TEXT);
+        cur=c.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema='public'
         """)
-        # V6: dados compartilhados por SKU nas etapas pós-BASE.
-        for n,t in [("foto_padrao","TEXT"),("video_padrao","TEXT"),("promo_padrao","TEXT"),("ads_padrao","TEXT")]:
-            if not col_exists(c,"produtos",n):
-                c.execute(f"ALTER TABLE produtos ADD COLUMN {n} {t}")
-        for n,t in [("foto_override","TEXT"),("video_override","TEXT"),("promo_override","TEXT"),("ads_override","TEXT")]:
-            if not col_exists(c,"anuncios",n):
-                c.execute(f"ALTER TABLE anuncios ADD COLUMN {n} {t}")
-        # migrate anuncios
-        for n,t,default in [
-            ("responsavel","TEXT",None),("entrada_etapa_em","TEXT",None),("inicio_etapa_em","TEXT",None),
-            ("prioridade","TEXT","'NORMAL'"),("prazo","TEXT",None),("correcao_origem","TEXT",None),
-            ("correcao_destino","TEXT",None),("correcao_retorno","TEXT",None),("correcao_motivo","TEXT",None)]:
-            if not col_exists(c,"anuncios",n):
-                c.execute(f"ALTER TABLE anuncios ADD COLUMN {n} {t}"+(f" DEFAULT {default}" if default else ""))
-        c.execute("UPDATE anuncios SET prioridade=COALESCE(prioridade,'NORMAL')")
-        c.execute("UPDATE anuncios SET entrada_etapa_em=COALESCE(entrada_etapa_em,atualizado_em,criado_em,?)",(now(),))
-
-        # robust V2/V4 usuarios migration
-        if table_exists(c,"usuarios"):
-            cols=[r["name"] for r in c.execute("PRAGMA table_info(usuarios)")]
-            if "login" not in cols:
-                c.execute("ALTER TABLE usuarios RENAME TO usuarios_legado")
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS usuarios(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,nome TEXT NOT NULL,login TEXT UNIQUE NOT NULL,senha TEXT NOT NULL,
-          perfil TEXT NOT NULL DEFAULT 'FUNCIONÁRIO',ativo INTEGER NOT NULL DEFAULT 1,criado_em TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS usuario_etapas(
-          usuario_id INTEGER NOT NULL,etapa TEXT NOT NULL,UNIQUE(usuario_id,etapa),
-          FOREIGN KEY(usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE);
-        CREATE TABLE IF NOT EXISTS login_sessions(
-          token TEXT PRIMARY KEY, usuario_id INTEGER NOT NULL, expira_em TEXT NOT NULL,
-          FOREIGN KEY(usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE);
-        """)
-        if table_exists(c,"usuarios_legado"):
-            for r in c.execute("SELECT * FROM usuarios_legado").fetchall():
-                nome=r["nome"] if "nome" in r.keys() else f"Usuário {r['id']}"
-                login="".join(ch.lower() for ch in nome if ch.isalnum()) or f"user{r['id']}"
-                base=login; k=1
-                while c.execute("SELECT 1 FROM usuarios WHERE login=?",(login,)).fetchone():
-                    k+=1;login=f"{base}{k}"
-                c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES(?,?,?,'FUNCIONÁRIO',1,?)",(nome,login,sh("abxon123"),now()))
-            c.execute("DROP TABLE usuarios_legado")
-        if c.execute("SELECT COUNT(*) n FROM usuarios WHERE perfil='ADMINISTRADOR'").fetchone()["n"]==0:
+        existentes={r["table_name"] for r in cur.fetchall()}
+        faltando=[t for t in tabelas if t not in existentes]
+        if faltando:
+            raise RuntimeError("Estrutura Supabase incompleta: "+", ".join(faltando))
+        n=c.execute("SELECT COUNT(*) AS n FROM usuarios WHERE perfil='ADMINISTRADOR'").fetchone()["n"]
+        if n==0:
             login="admin"
-            if c.execute("SELECT 1 FROM usuarios WHERE login='admin'").fetchone(): login="adminmpx"
-            c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES('Administrador ABX-ON',?,?, 'ADMINISTRADOR',1,?)",(login,sh("abxon123"),now()))
+            if c.execute("SELECT 1 FROM usuarios WHERE login=%s",(login,)).fetchone():
+                login="adminabx"
+            c.execute("""INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em)
+                       VALUES(%s,%s,%s,'ADMINISTRADOR',1,%s)""",
+                      ("Administrador ABX-ON",login,sh("abxon123"),now()))
 
-def log(c,i,e,a,o=""): c.execute("INSERT INTO historico(anuncio_id,data_hora,etapa,acao,observacao) VALUES(?,?,?,?,?)",(i,now(),e,a,o))
+def log(c,i,e,a,o=""): c.execute("INSERT INTO historico(anuncio_id,data_hora,etapa,acao,observacao) VALUES(%s,%s,%s,%s,%s)",(i,now(),e,a,o))
 def perms(uid):
-    with con() as c:return [r["etapa"] for r in c.execute("SELECT etapa FROM usuario_etapas WHERE usuario_id=?",(uid,))]
+    with con() as c:return [r["etapa"] for r in c.execute("SELECT etapa FROM usuario_etapas WHERE usuario_id=%s",(uid,))]
 def criar_user(nome,login,senha,perfil,ets):
     login=norm_login(login)
     with con() as c:
-        if c.execute("SELECT 1 FROM usuarios WHERE lower(login)=lower(?)",(login,)).fetchone():
-            raise sqlite3.IntegrityError("Login já existe")
-        cur=c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES(?,?,?,?,1,?)",(nome,login,sh(senha),perfil,now()))
-        for e in ets:c.execute("INSERT INTO usuario_etapas VALUES(?,?)",(cur.lastrowid,e))
+        if c.execute("SELECT 1 FROM usuarios WHERE lower(login)=lower(%s)",(login,)).fetchone():
+            raise psycopg.errors.UniqueViolation("Login já existe")
+        cur=c.execute("INSERT INTO usuarios(nome,login,senha,perfil,ativo,criado_em) VALUES(%s,%s,%s,%s,1,%s) RETURNING id",(nome,login,sh(senha),perfil,now()))
+        uid=cur.fetchone()["id"]
+        for e in ets:c.execute("INSERT INTO usuario_etapas(usuario_id,etapa) VALUES(%s,%s)",(uid,e))
 def update_user(uid,nome,perfil,ativo,ets,senha=""):
     with con() as c:
-        c.execute("UPDATE usuarios SET nome=?,perfil=?,ativo=? WHERE id=?",(nome,perfil,int(ativo),uid))
-        if senha:c.execute("UPDATE usuarios SET senha=? WHERE id=?",(sh(senha),uid))
-        c.execute("DELETE FROM usuario_etapas WHERE usuario_id=?",(uid,))
-        for e in ets:c.execute("INSERT INTO usuario_etapas VALUES(?,?)",(uid,e))
+        c.execute("UPDATE usuarios SET nome=%s,perfil=%s,ativo=%s WHERE id=%s",(nome,perfil,int(ativo),uid))
+        if senha:c.execute("UPDATE usuarios SET senha=%s WHERE id=%s",(sh(senha),uid))
+        c.execute("DELETE FROM usuario_etapas WHERE usuario_id=%s",(uid,))
+        for e in ets:c.execute("INSERT INTO usuario_etapas VALUES(%s,%s)",(uid,e))
 
 def criar_anuncios(sku,q,ts,ds,ps,user,prioridade,prazo):
     with con() as c:
-        t=now();c.execute("INSERT OR IGNORE INTO produtos(sku,criado_em) VALUES(?,?)",(sku,t))
-        n=c.execute("SELECT COALESCE(MAX(numero),0)n FROM anuncios WHERE sku=?",(sku,)).fetchone()["n"]
+        t=now();c.execute("INSERT INTO produtos(sku,criado_em) VALUES(%s,%s) ON CONFLICT (sku) DO NOTHING",(sku,t))
+        n=c.execute("SELECT COALESCE(MAX(numero),0)n FROM anuncios WHERE sku=%s",(sku,)).fetchone()["n"]
         for j in range(q):
             cur=c.execute("""INSERT INTO anuncios(sku,numero,titulo,descricao,preco,etapa,status,criado_em,atualizado_em,entrada_etapa_em,prioridade,prazo)
-            VALUES(?,?,?,?,?,'BASE','AGUARDANDO',?,?,?,?,?)""",(sku,n+j+1,ts[j],ds[j],ps[j],t,t,t,prioridade,prazo or None))
-            log(c,cur.lastrowid,"BASE","ANÚNCIO CRIADO",user["nome"])
+            VALUES(%s,%s,%s,%s,%s,'BASE','AGUARDANDO',%s,%s,%s,%s,%s) RETURNING id""",(sku,n+j+1,ts[j],ds[j],ps[j],t,t,t,prioridade,prazo or None))
+            novo_id=cur.fetchone()["id"]
+            log(c,novo_id,"BASE","ANÚNCIO CRIADO",user["nome"])
 
 def abrir(i,user):
     with con() as c:
-        a=c.execute("SELECT * FROM anuncios WHERE id=?",(i,)).fetchone()
+        a=c.execute("SELECT * FROM anuncios WHERE id=%s",(i,)).fetchone()
         if not a["inicio_etapa_em"]:
             t=now()
             tem_correcao=bool(a["correcao_retorno"] or a["correcao_origem"] or a["correcao_destino"])
             novo_status="CORRIGIR" if tem_correcao else "EM ANDAMENTO"
-            c.execute("UPDATE anuncios SET inicio_etapa_em=?,responsavel=?,status=?,atualizado_em=? WHERE id=?",
+            c.execute("UPDATE anuncios SET inicio_etapa_em=%s,responsavel=%s,status=%s,atualizado_em=%s WHERE id=%s",
                       (t,user["nome"],novo_status,t,i))
             log(c,i,a["etapa"],"CORREÇÃO ABERTA" if tem_correcao else "TRABALHO ABERTO",user["nome"])
 
@@ -145,13 +112,13 @@ def validar(etapa,campos):
 
 def finalizar(i,user,campos):
     with con() as c:
-        a=c.execute("SELECT * FROM anuncios WHERE id=?",(i,)).fetchone()
+        a=c.execute("SELECT * FROM anuncios WHERE id=%s",(i,)).fetchone()
         erro=validar(a["etapa"],campos)
         if erro:return erro
-        if a["etapa"]=="BASE":c.execute("UPDATE anuncios SET titulo=?,descricao=?,preco=? WHERE id=?",(campos["titulo"],campos["descricao"],campos["preco"],i))
-        elif a["etapa"]=="FOTO":c.execute("UPDATE anuncios SET link_foto=? WHERE id=?",(campos["foto"],i))
-        elif a["etapa"]=="FÍSICA":c.execute("UPDATE produtos SET altura=?,largura=?,comprimento=?,peso=? WHERE sku=?",(campos["altura"],campos["largura"],campos["comprimento"],campos["peso"],a["sku"]))
-        elif a["etapa"]=="VÍDEO":c.execute("UPDATE anuncios SET link_video=? WHERE id=?",(campos["video"],i))
+        if a["etapa"]=="BASE":c.execute("UPDATE anuncios SET titulo=%s,descricao=%s,preco=%s WHERE id=%s",(campos["titulo"],campos["descricao"],campos["preco"],i))
+        elif a["etapa"]=="FOTO":c.execute("UPDATE anuncios SET link_foto=%s WHERE id=%s",(campos["foto"],i))
+        elif a["etapa"]=="FÍSICA":c.execute("UPDATE produtos SET altura=%s,largura=%s,comprimento=%s,peso=%s WHERE sku=%s",(campos["altura"],campos["largura"],campos["comprimento"],campos["peso"],a["sku"]))
+        elif a["etapa"]=="VÍDEO":c.execute("UPDATE anuncios SET link_video=%s WHERE id=%s",(campos["video"],i))
         atual=a["etapa"];t=now();log(c,i,atual,"ETAPA CONCLUÍDA",user["nome"])
         # V5.1: correção sempre retorna diretamente para a etapa que solicitou.
         # V5.3: a etapa que pediu a correção tem prioridade absoluta sobre o fluxo normal.
@@ -159,34 +126,34 @@ def finalizar(i,user,campos):
         motivo_original=a["correcao_motivo"]
         eh_correcao=bool(a["correcao_retorno"] or a["correcao_origem"] or a["correcao_destino"])
         if eh_correcao and retorno:
-            c.execute("""UPDATE anuncios SET etapa=?,status='AGUARDANDO',responsavel=NULL,entrada_etapa_em=?,inicio_etapa_em=NULL,
-            atualizado_em=?,correcao_origem=NULL,correcao_destino=NULL,correcao_retorno=NULL,correcao_motivo=NULL WHERE id=?""",(retorno,t,t,i))
+            c.execute("""UPDATE anuncios SET etapa=%s,status='AGUARDANDO',responsavel=NULL,entrada_etapa_em=%s,inicio_etapa_em=NULL,
+            atualizado_em=%s,correcao_origem=NULL,correcao_destino=NULL,correcao_retorno=NULL,correcao_motivo=NULL WHERE id=%s""",(retorno,t,t,i))
             log(c,i,retorno,"CORREÇÃO CONCLUÍDA / RETORNO DIRETO",
                 f"{user['nome']} corrigiu em {atual}. Motivo original: {motivo_original or '—'}")
             return None
         k=ETAPAS.index(atual)
         if k==len(ETAPAS)-1:
-            c.execute("UPDATE anuncios SET status='OK',responsavel=?,atualizado_em=? WHERE id=?",(user["nome"],t,i));log(c,i,"ADS","ANÚNCIO FINALIZADO",user["nome"])
+            c.execute("UPDATE anuncios SET status='OK',responsavel=%s,atualizado_em=%s WHERE id=%s",(user["nome"],t,i));log(c,i,"ADS","ANÚNCIO FINALIZADO",user["nome"])
         else:
-            e=ETAPAS[k+1];c.execute("UPDATE anuncios SET etapa=?,status='AGUARDANDO',responsavel=NULL,entrada_etapa_em=?,inicio_etapa_em=NULL,atualizado_em=? WHERE id=?",(e,t,t,i));log(c,i,e,"TRABALHO RECEBIDO")
+            e=ETAPAS[k+1];c.execute("UPDATE anuncios SET etapa=%s,status='AGUARDANDO',responsavel=NULL,entrada_etapa_em=%s,inicio_etapa_em=NULL,atualizado_em=%s WHERE id=%s",(e,t,t,i));log(c,i,e,"TRABALHO RECEBIDO")
         return None
 
 def enviar_correcao(i,user,destino,motivo):
     with con() as c:
-        a=c.execute("SELECT * FROM anuncios WHERE id=?",(i,)).fetchone();t=now()
-        c.execute("""UPDATE anuncios SET etapa=?,status='CORRIGIR',responsavel=NULL,entrada_etapa_em=?,inicio_etapa_em=NULL,
-        atualizado_em=?,correcao_origem=?,correcao_destino=?,correcao_retorno=?,correcao_motivo=? WHERE id=?""",
+        a=c.execute("SELECT * FROM anuncios WHERE id=%s",(i,)).fetchone();t=now()
+        c.execute("""UPDATE anuncios SET etapa=%s,status='CORRIGIR',responsavel=NULL,entrada_etapa_em=%s,inicio_etapa_em=NULL,
+        atualizado_em=%s,correcao_origem=%s,correcao_destino=%s,correcao_retorno=%s,correcao_motivo=%s WHERE id=%s""",
         (destino,t,t,a["etapa"],destino,a["etapa"],motivo,i))
         log(c,i,destino,"CORREÇÃO SOLICITADA",f"{user['nome']} | origem {a['etapa']} | {motivo}")
 
 def fila(etapa):
-    with con() as c:rows=c.execute("SELECT * FROM anuncios WHERE etapa=? AND status!='OK'",(etapa,)).fetchall()
+    with con() as c:rows=c.execute("SELECT * FROM anuncios WHERE etapa=%s AND status!='OK'",(etapa,)).fetchall()
     return sorted(rows,key=lambda x:(0 if x["status"]=="CORRIGIR" else 1,PESO_PRI.get(x["prioridade"],2),x["entrada_etapa_em"] or ""))
 
 
 def anuncios_do_sku_na_etapa(sku,etapa):
     with con() as c:
-        return c.execute("SELECT * FROM anuncios WHERE sku=? AND etapa=? AND status!='OK' ORDER BY numero",(sku,etapa)).fetchall()
+        return c.execute("SELECT * FROM anuncios WHERE sku=%s AND etapa=%s AND status!='OK' ORDER BY numero",(sku,etapa)).fetchall()
 
 def finalizar_grupo(sku,etapa,user,campos,personalizados=None):
     """Finaliza todos os anúncios do mesmo SKU que estão juntos na etapa.
@@ -194,35 +161,35 @@ def finalizar_grupo(sku,etapa,user,campos,personalizados=None):
     """
     personalizados=personalizados or {}
     with con() as c:
-        grupo=c.execute("SELECT * FROM anuncios WHERE sku=? AND etapa=? AND status!='OK' ORDER BY numero",(sku,etapa)).fetchall()
+        grupo=c.execute("SELECT * FROM anuncios WHERE sku=%s AND etapa=%s AND status!='OK' ORDER BY numero",(sku,etapa)).fetchall()
         if not grupo:return "Nenhum anúncio disponível nesta etapa."
-        p=c.execute("SELECT * FROM produtos WHERE sku=?",(sku,)).fetchone()
+        p=c.execute("SELECT * FROM produtos WHERE sku=%s",(sku,)).fetchone()
         if etapa=="FOTO" and not campos.get("foto","").strip():return "Informe o link da foto."
         if etapa=="VÍDEO" and not campos.get("video","").strip():return "Informe o link do vídeo."
         if etapa=="FÍSICA" and any(float(campos.get(k,0) or 0)<=0 for k in ["altura","largura","comprimento","peso"]):
             return "Preencha altura, largura, comprimento e peso."
-        if etapa=="FOTO": c.execute("UPDATE produtos SET foto_padrao=? WHERE sku=?",(campos["foto"],sku))
-        if etapa=="VÍDEO": c.execute("UPDATE produtos SET video_padrao=? WHERE sku=?",(campos["video"],sku))
-        if etapa=="PROMO": c.execute("UPDATE produtos SET promo_padrao=? WHERE sku=?",(campos.get("promo",""),sku))
-        if etapa=="ADS": c.execute("UPDATE produtos SET ads_padrao=? WHERE sku=?",(campos.get("ads",""),sku))
+        if etapa=="FOTO": c.execute("UPDATE produtos SET foto_padrao=%s WHERE sku=%s",(campos["foto"],sku))
+        if etapa=="VÍDEO": c.execute("UPDATE produtos SET video_padrao=%s WHERE sku=%s",(campos["video"],sku))
+        if etapa=="PROMO": c.execute("UPDATE produtos SET promo_padrao=%s WHERE sku=%s",(campos.get("promo",""),sku))
+        if etapa=="ADS": c.execute("UPDATE produtos SET ads_padrao=%s WHERE sku=%s",(campos.get("ads",""),sku))
         if etapa=="FÍSICA":
-            c.execute("UPDATE produtos SET altura=?,largura=?,comprimento=?,peso=? WHERE sku=?",
+            c.execute("UPDATE produtos SET altura=%s,largura=%s,comprimento=%s,peso=%s WHERE sku=%s",
                       (campos["altura"],campos["largura"],campos["comprimento"],campos["peso"],sku))
     # Reuse the already-tested per-ad transition/correction engine.
     for a in grupo:
         with con() as c:
             if etapa=="FOTO":
                 v=personalizados.get(a["id"],"")
-                c.execute("UPDATE anuncios SET link_foto=?,foto_override=? WHERE id=?",(v or campos["foto"],v or None,a["id"]))
+                c.execute("UPDATE anuncios SET link_foto=%s,foto_override=%s WHERE id=%s",(v or campos["foto"],v or None,a["id"]))
             elif etapa=="VÍDEO":
                 v=personalizados.get(a["id"],"")
-                c.execute("UPDATE anuncios SET link_video=?,video_override=? WHERE id=?",(v or campos["video"],v or None,a["id"]))
+                c.execute("UPDATE anuncios SET link_video=%s,video_override=%s WHERE id=%s",(v or campos["video"],v or None,a["id"]))
             elif etapa=="PROMO":
                 v=personalizados.get(a["id"],"")
-                c.execute("UPDATE anuncios SET promo_override=? WHERE id=?",(v or None,a["id"]))
+                c.execute("UPDATE anuncios SET promo_override=%s WHERE id=%s",(v or None,a["id"]))
             elif etapa=="ADS":
                 v=personalizados.get(a["id"],"")
-                c.execute("UPDATE anuncios SET ads_override=? WHERE id=?",(v or None,a["id"]))
+                c.execute("UPDATE anuncios SET ads_override=%s WHERE id=%s",(v or None,a["id"]))
         er=finalizar(a["id"],user,campos)
         if er:return er
     return None
@@ -230,8 +197,8 @@ def finalizar_grupo(sku,etapa,user,campos,personalizados=None):
 def trabalho(a,user):
     abrir(a["id"],user)
     with con() as c:
-        a=c.execute("SELECT * FROM anuncios WHERE id=?",(a["id"],)).fetchone()
-        p=c.execute("SELECT * FROM produtos WHERE sku=?",(a["sku"],)).fetchone()
+        a=c.execute("SELECT * FROM anuncios WHERE id=%s",(a["id"],)).fetchone()
+        p=c.execute("SELECT * FROM produtos WHERE sku=%s",(a["sku"],)).fetchone()
     etapa=a["etapa"]
     grupo=anuncios_do_sku_na_etapa(a["sku"],etapa)
     # BASE remains independent per listing; correction also remains independent.
@@ -298,12 +265,12 @@ def trabalho(a,user):
         with st.expander("↩ Enviar para correção"):
             if agrupar:
                 opcoes={f"Anúncio {x['numero']} — {x['titulo'] or 'Sem título'}":x["id"] for x in grupo}
-                escolhidos=st.multiselect("Qual(is) anúncio(s) precisa(m) de correção?",list(opcoes.keys()))
+                escolhidos=st.multiselect("Qual(is) anúncio(s) precisa(m) de correção%s",list(opcoes.keys()))
                 st.caption(f"SKU {a['sku']} possui {len(grupo)} anúncios nesta etapa. Selecione um, vários ou todos.")
             else:
                 opcoes={f"Anúncio {a['numero']} — {a['titulo'] or 'Sem título'}":a["id"]}
                 escolhidos=list(opcoes.keys())
-            destino=st.selectbox("Enviar para qual etapa?",destinos)
+            destino=st.selectbox("Enviar para qual etapa%s",destinos)
             motivo=st.text_area("Motivo / observação da correção")
             if st.button("ENVIAR CORREÇÃO"):
                 ids=[opcoes[x] for x in escolhidos]
@@ -317,22 +284,27 @@ def criar_sessao_persistente(uid):
     token=secrets.token_urlsafe(32)
     exp=(datetime.now()+timedelta(days=30)).isoformat(timespec="seconds")
     with con() as c:
-        c.execute("DELETE FROM login_sessions WHERE usuario_id=? OR expira_em<?",(uid,now()))
-        c.execute("INSERT INTO login_sessions(token,usuario_id,expira_em) VALUES(?,?,?)",(token,uid,exp))
+        c.execute("DELETE FROM login_sessions WHERE usuario_id=%s OR expira_em<%s",(uid,now()))
+        c.execute("INSERT INTO login_sessions(token,usuario_id,expira_em) VALUES(%s,%s,%s)",(token,uid,exp))
     return token
 
 def usuario_por_token(token):
     if not token:return None
     with con() as c:
         r=c.execute("""SELECT u.* FROM login_sessions s JOIN usuarios u ON u.id=s.usuario_id
-                     WHERE s.token=? AND s.expira_em>? AND u.ativo=1""",(token,now())).fetchone()
+                     WHERE s.token=%s AND s.expira_em>%s AND u.ativo=1""",(token,now())).fetchone()
     return r
 
 def remover_sessao(token):
     if token:
-        with con() as c:c.execute("DELETE FROM login_sessions WHERE token=?",(token,))
+        with con() as c:c.execute("DELETE FROM login_sessions WHERE token=%s",(token,))
 
-init()
+try:
+    init()
+except Exception as e:
+    st.error("Não foi possível conectar ao banco PostgreSQL/Supabase.")
+    st.code(str(e))
+    st.stop()
 
 # Cookie persistente: mantém o funcionário conectado por até 30 dias, até clicar em Sair.
 COOKIE_NAME="abxon_login"
@@ -360,7 +332,7 @@ if "uid" not in st.session_state:
     with st.form("login"):
         login=st.text_input("Usuário");senha=st.text_input("Senha",type="password");go=st.form_submit_button("ENTRAR",type="primary",use_container_width=True)
     if go:
-        with con() as c:u=c.execute("SELECT * FROM usuarios WHERE lower(login)=lower(?) AND senha=? AND ativo=1",(norm_login(login),sh(senha))).fetchone()
+        with con() as c:u=c.execute("SELECT * FROM usuarios WHERE lower(login)=lower(%s) AND senha=%s AND ativo=1",(norm_login(login),sh(senha))).fetchone()
         if u:
             token=criar_sessao_persistente(u["id"])
             set_cookie(COOKIE_NAME,token,30)
@@ -376,7 +348,7 @@ Caso ainda não tenha acesso, solicite seu cadastro ao administrador do sistema.
 """)
     st.stop()
 
-with con() as c:user=c.execute("SELECT * FROM usuarios WHERE id=?",(st.session_state.uid,)).fetchone()
+with con() as c:user=c.execute("SELECT * FROM usuarios WHERE id=%s",(st.session_state.uid,)).fetchone()
 if not user or not user["ativo"]:st.session_state.clear();st.rerun()
 ets=perms(user["id"]);adm=user["perfil"]=="ADMINISTRADOR";gest=user["perfil"] in ["ADMINISTRADOR","GESTOR"]
 st.sidebar.write(f"**{user['nome']}**");st.sidebar.caption(user["perfil"])
@@ -393,7 +365,7 @@ if pag=="🏠 Meus Trabalhos":
     minhas=ETAPAS if adm else ets
     if not minhas:st.warning("O administrador ainda não atribuiu uma etapa ao seu acesso.");st.stop()
     if "aberto" in st.session_state:
-        with con() as c:a= c.execute("SELECT * FROM anuncios WHERE id=?",(st.session_state.aberto,)).fetchone()
+        with con() as c:a= c.execute("SELECT * FROM anuncios WHERE id=%s",(st.session_state.aberto,)).fetchone()
         if st.button("← Voltar"):st.session_state.pop("aberto");st.rerun()
         trabalho(a,user)
     else:
@@ -409,7 +381,7 @@ if pag=="🏠 Meus Trabalhos":
                     vistos.add(chave);compact.append(x)
             rows=compact
         hoje=datetime.now().strftime("%Y-%m-%d")
-        with con() as c:feitos=c.execute("SELECT COUNT(*) n FROM historico WHERE acao='ETAPA CONCLUÍDA' AND observacao=? AND substr(data_hora,1,10)=?",(user["nome"],hoje)).fetchone()["n"]
+        with con() as c:feitos=c.execute("SELECT COUNT(*) n FROM historico WHERE acao='ETAPA CONCLUÍDA' AND observacao=%s AND substr(data_hora,1,10)=%s",(user["nome"],hoje)).fetchone()["n"]
         c1,c2,c3=st.columns(3);c1.metric("Para fazer",len(rows));c2.metric("Correções",sum(x["status"]=="CORRIGIR" for x in rows));c3.metric("Concluídos hoje",feitos)
         if rows and st.button("▶ ABRIR PRÓXIMO TRABALHO",type="primary",use_container_width=True):
             st.session_state.aberto=rows[0]["id"];st.rerun()
@@ -417,7 +389,7 @@ if pag=="🏠 Meus Trabalhos":
             ico="🔴" if x["prioridade"]=="URGENTE" else "🟡" if x["prioridade"]=="PRIORIDADE" else "⚪"
             with st.container(border=True):
                 if etapa!="BASE" and x["status"]!="CORRIGIR":
-                    with con() as c:nv=c.execute("SELECT COUNT(*) n FROM anuncios WHERE sku=? AND etapa=? AND status!='OK'",(x["sku"],etapa)).fetchone()["n"]
+                    with con() as c:nv=c.execute("SELECT COUNT(*) n FROM anuncios WHERE sku=%s AND etapa=%s AND status!='OK'",(x["sku"],etapa)).fetchone()["n"]
                     st.write(f"**{ico} {x['sku']} · 🧩 {nv} anúncio(s) vinculados**")
                 else:
                     st.write(f"**{ico} {x['sku']} · Anúncio {x['numero']}**")
@@ -437,8 +409,8 @@ elif pag=="📊 Gestão":
     with con() as c:
         ativos=c.execute("SELECT * FROM anuncios WHERE status!='OK'").fetchall()
         hoje=datetime.now().strftime("%Y-%m-%d")
-        entraram=c.execute("SELECT COUNT(*) n FROM anuncios WHERE substr(criado_em,1,10)=?",(hoje,)).fetchone()["n"]
-        finais=c.execute("SELECT COUNT(*) n FROM historico WHERE acao='ANÚNCIO FINALIZADO' AND substr(data_hora,1,10)=?",(hoje,)).fetchone()["n"]
+        entraram=c.execute("SELECT COUNT(*) n FROM anuncios WHERE substr(criado_em,1,10)=%s",(hoje,)).fetchone()["n"]
+        finais=c.execute("SELECT COUNT(*) n FROM historico WHERE acao='ANÚNCIO FINALIZADO' AND substr(data_hora,1,10)=%s",(hoje,)).fetchone()["n"]
         corrs=c.execute("SELECT COUNT(*) n FROM anuncios WHERE status='CORRIGIR'").fetchone()["n"]
     a,b,c=st.columns(3);a.metric("Entraram hoje",entraram);b.metric("Finalizados hoje",finais);c.metric("Em correção",corrs)
     cols=st.columns(6)
@@ -460,7 +432,7 @@ elif pag=="⚙️ Administração":
             try:
                 if nome and login and senha:criar_user(nome,login,senha,perfil,pe);st.success("Criado.");st.rerun()
                 else:st.error("Preencha nome, login e senha.")
-            except sqlite3.IntegrityError:st.error("Login já existe.")
+            except psycopg.errors.UniqueViolation:st.error("Login já existe.")
         with con() as c:us=c.execute("SELECT * FROM usuarios ORDER BY ativo DESC,nome").fetchall()
         for u in us:
             with st.expander(f"{'🟢' if u['ativo'] else '⚫'} {u['nome']} · {u['perfil']}"):
@@ -488,8 +460,8 @@ else:
     q=st.text_input("Digite o SKU").strip().upper()
     if q:
         with con() as c:
-            ans=c.execute("SELECT * FROM anuncios WHERE sku=? ORDER BY numero",(q,)).fetchall()
-            hist=c.execute("""SELECT h.data_hora,h.etapa,h.acao,h.observacao FROM historico h JOIN anuncios a ON a.id=h.anuncio_id WHERE a.sku=? ORDER BY h.id DESC""",(q,)).fetchall()
+            ans=c.execute("SELECT * FROM anuncios WHERE sku=%s ORDER BY numero",(q,)).fetchall()
+            hist=c.execute("""SELECT h.data_hora,h.etapa,h.acao,h.observacao FROM historico h JOIN anuncios a ON a.id=h.anuncio_id WHERE a.sku=%s ORDER BY h.id DESC""",(q,)).fetchall()
         if not ans:st.warning("SKU não encontrado.")
         for x in ans:
             with st.container(border=True):
